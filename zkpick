@@ -1,0 +1,441 @@
+#!/usr/bin/env bash
+# zkpick - rofi/wofi launcher for zk notebook
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load config
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/zkpick/config.sh"
+if [[ -f "$CONFIG_FILE" ]]; then
+  source "$CONFIG_FILE"
+elif [[ -f "$SCRIPT_DIR/config.sh" ]]; then
+  source "$SCRIPT_DIR/config.sh"
+fi
+
+# Load common functions
+source "$SCRIPT_DIR/lib/common.sh"
+
+# Current notebook (can be overridden)
+NOTEBOOK_DIR=""
+
+# Set notebook directory with optional override
+set_notebook() {
+  if [[ -n "$NOTEBOOK_DIR" ]]; then
+    export ZK_NOTEBOOK_DIR="$NOTEBOOK_DIR"
+  elif [[ -n "${ZKO_DEFAULT_NOTEBOOK:-}" ]]; then
+    export ZK_NOTEBOOK_DIR="$ZKO_DEFAULT_NOTEBOOK"
+  fi
+}
+
+# Main menu
+show_main_menu() {
+  local idx
+  idx=$(printf '%s\n' \
+    "  Search notes" \
+    "  New note" \
+    "  Daily journal" \
+    "  Weekly journal" \
+    "  Browse tags" \
+    "  Recent notes" \
+    "  Orphan notes" \
+    "  Switch notebook" | run_menu "zk")
+
+  [[ -z "$idx" ]] && return
+
+  case "$idx" in
+  0) do_search ;;
+  1) do_new_note ;;
+  2) do_daily ;;
+  3) do_weekly ;;
+  4) do_browse_tags ;;
+  5) do_recent ;;
+  6) do_orphans ;;
+  7) do_switch_notebook ;;
+  esac
+}
+
+# Format note for display
+# $1: title, $2: filename
+format_note_display() {
+  local title="$1" filename="$2"
+
+  if [[ "${ZKO_USE_COLORS:-false}" == "true" ]]; then
+    printf '<span color="#f1c40f">%s</span>' "$title"
+    if [[ "${ZKO_SHOW_FILENAME:-false}" == "true" ]]; then
+      printf '  <span color="#2ecc71">%s</span>' "$filename"
+    fi
+  else
+    printf '%s' "$title"
+    if [[ "${ZKO_SHOW_FILENAME:-false}" == "true" ]]; then
+      printf '  %s' "$filename"
+    fi
+  fi
+  printf '\n'
+}
+
+# Search notes
+do_search() {
+  set_notebook
+
+  local idx path
+  local tmpfile=$(mktemp)
+  local displayfile=$(mktemp)
+  trap "rm -f $tmpfile $displayfile" RETURN
+
+  # Store paths only (line-by-line)
+  zk list --format json -q 2>/dev/null |
+    jq -r '.[] | "\(.title)\t\(.filename)\t\(.absPath)"' >"$tmpfile"
+
+  # Create display file
+  while IFS=$'\t' read -r t f p; do
+    format_note_display "$t" "$f"
+  done <"$tmpfile" >"$displayfile"
+
+  # run_menu returns index (0-based for rofi, 1-based for wofi)
+  idx=$(run_menu "Search" <"$displayfile")
+  [[ -z "$idx" ]] && return
+
+  # rofi returns 0-based index, convert to 1-based for sed
+  local linenum=$((idx + 1))
+  path=$(sed -n "${linenum}p" "$tmpfile" | cut -f3)
+
+  [[ -n "$path" ]] && open_in_editor "$path"
+}
+
+# Create new note
+do_new_note() {
+  set_notebook
+  local title
+  title=$(run_prompt "Title")
+
+  [[ -z "$title" ]] && return
+
+  # Ask for optional tag
+  local tags
+  tags=$(zk tag list --format "{{name}}" -q 2>/dev/null || true)
+
+  local selected_tag=""
+  if [[ -n "$tags" ]]; then
+    local tag_options=$(printf '%s\n' "(no tag)" $tags)
+    local tag_idx=$(echo "$tag_options" | run_menu "Tag (optional)")
+    if [[ -n "$tag_idx" && "$tag_idx" != "0" ]]; then
+      selected_tag=$(echo "$tag_options" | sed -n "$((tag_idx + 1))p")
+    fi
+  fi
+
+  # Create note
+  local note_path
+  if [[ -n "$selected_tag" ]]; then
+    note_path=$(zk new --title "$title" --extra "tags=$selected_tag" --print-path 2>/dev/null)
+  else
+    note_path=$(zk new --title "$title" --print-path 2>/dev/null)
+  fi
+
+  if [[ -n "$note_path" ]]; then
+    open_in_editor "$note_path"
+    notify "Created: $title"
+  fi
+}
+
+# Daily journal
+do_daily() {
+  set_notebook
+
+  # Create or open today's note
+  local note_path
+  note_path=$(zk new "${ZKO_DAILY_DIR:-journal/daily}" --print-path --no-input 2>/dev/null || true)
+
+  if [[ -n "$note_path" ]]; then
+    open_in_editor "$note_path"
+  else
+    notify "Daily journal not configured. Create ${ZKO_DAILY_DIR:-journal/daily} directory in your notebook."
+  fi
+}
+
+# Weekly journal
+do_weekly() {
+  set_notebook
+
+  # Create or open this week's note
+  local note_path
+  note_path=$(zk new "${ZKO_WEEKLY_DIR:-journal/daily}" --print-path --no-input 2>/dev/null || true)
+
+  if [[ -n "$note_path" ]]; then
+    open_in_editor "$note_path"
+  else
+    notify "Weekly journal not configured. Create ${ZKO_WEEKLY_DIR:-journal/daily} directory in your notebook."
+  fi
+}
+
+# Browse tags
+do_browse_tags() {
+  set_notebook
+  local tags
+  tags=$(zk tag list --format "{{name}} ({{note-count}})" -q 2>/dev/null)
+
+  [[ -z "$tags" ]] && {
+    notify "No tags found"
+    return
+  }
+
+  local idx
+  idx=$(echo "$tags" | run_menu "Tags")
+
+  [[ -z "$idx" ]] && return
+
+  # Get selected tag and extract name
+  local selected
+  selected=$(echo "$tags" | sed -n "$((idx + 1))p")
+  local tag_name
+  tag_name=$(echo "$selected" | sed 's/ (.*//')
+
+  # Show notes with this tag
+  local idx path
+  local tmpfile=$(mktemp)
+  local displayfile=$(mktemp)
+  trap "rm -f $tmpfile $displayfile" RETURN
+
+  zk list --format json -t "$tag_name" -q 2>/dev/null |
+    jq -r '.[] | "\(.title)\t\(.filename)\t\(.absPath)"' >"$tmpfile"
+
+  while IFS=$'\t' read -r t f p; do
+    format_note_display "$t" "$f"
+  done <"$tmpfile" >"$displayfile"
+
+  idx=$(run_menu "Tag: $tag_name" <"$displayfile")
+  [[ -z "$idx" ]] && return
+
+  local linenum=$((idx + 1))
+  path=$(sed -n "${linenum}p" "$tmpfile" | cut -f3)
+
+  [[ -n "$path" ]] && open_in_editor "$path"
+}
+
+# Recent notes
+do_recent() {
+  set_notebook
+
+  local idx path
+  local tmpfile=$(mktemp)
+  local displayfile=$(mktemp)
+  trap "rm -f $tmpfile $displayfile" RETURN
+
+  # title\tfilename\tdate\tabsPath
+  zk list --format json -s modified- -n "${ZKO_RECENT_LIMIT:-20}" -q 2>/dev/null |
+    jq -r '.[] | "\(.title)\t\(.filename)\t\(.modified | split("T")[0])\t\(.absPath)"' >"$tmpfile"
+
+  while IFS=$'\t' read -r t f d p; do
+    if [[ "${ZKO_USE_COLORS:-false}" == "true" ]]; then
+      printf '<span color="#f1c40f">%s</span>' "$t"
+      if [[ "${ZKO_SHOW_FILENAME:-false}" == "true" ]]; then
+        printf '  <span color="#2ecc71">%s</span>' "$f"
+      fi
+      printf '  <span color="#95a5a6">%s</span>\n' "$d"
+    else
+      printf '%s' "$t"
+      if [[ "${ZKO_SHOW_FILENAME:-false}" == "true" ]]; then
+        printf '  %s' "$f"
+      fi
+      printf '  %s\n' "$d"
+    fi
+  done <"$tmpfile" >"$displayfile"
+
+  idx=$(run_menu "Recent" <"$displayfile")
+  [[ -z "$idx" ]] && return
+
+  local linenum=$((idx + 1))
+  path=$(sed -n "${linenum}p" "$tmpfile" | cut -f4)
+
+  [[ -n "$path" ]] && open_in_editor "$path"
+}
+
+# Orphan notes
+do_orphans() {
+  set_notebook
+
+  local idx path
+  local tmpfile=$(mktemp)
+  local displayfile=$(mktemp)
+  trap "rm -f $tmpfile $displayfile" RETURN
+
+  zk list --format json --orphan -q 2>/dev/null |
+    jq -r '.[] | "\(.title)\t\(.filename)\t\(.absPath)"' >"$tmpfile"
+
+  while IFS=$'\t' read -r t f p; do
+    format_note_display "$t" "$f"
+  done <"$tmpfile" >"$displayfile"
+
+  idx=$(run_menu "Orphans" <"$displayfile")
+  [[ -z "$idx" ]] && return
+
+  local linenum=$((idx + 1))
+  path=$(sed -n "${linenum}p" "$tmpfile" | cut -f3)
+
+  [[ -n "$path" ]] && open_in_editor "$path"
+}
+
+# Switch notebook
+do_switch_notebook() {
+  local notebooks_list=""
+
+  # Add configured notebooks
+  if [[ ${#ZKO_NOTEBOOKS[@]} -gt 0 ]]; then
+    for nb in "${ZKO_NOTEBOOKS[@]}"; do
+      [[ -d "$nb/.zk" ]] && notebooks_list+="$nb"$'\n'
+    done
+  fi
+
+  # Add auto-discovered notebooks
+  local discovered
+  discovered=$(list_notebooks)
+  if [[ -n "$discovered" ]]; then
+    notebooks_list+="$discovered"$'\n'
+  fi
+
+  # Remove duplicates and empty lines
+  notebooks_list=$(echo "$notebooks_list" | grep -v '^$' | sort -u)
+
+  # Add option to enter custom path
+  local menu_items="[Enter path manually]"$'\n'"$notebooks_list"
+
+  local idx
+  idx=$(echo "$menu_items" | run_menu "Notebook")
+
+  [[ -z "$idx" ]] && return
+
+  local selected
+  if [[ "$idx" == "0" ]]; then
+    # Manual path entry
+    selected=$(run_prompt "Notebook path")
+    [[ -z "$selected" ]] && return
+    if [[ ! -d "$selected/.zk" ]]; then
+      notify "Not a valid zk notebook: $selected"
+      return
+    fi
+  else
+    selected=$(echo "$menu_items" | sed -n "$((idx + 1))p")
+  fi
+
+  NOTEBOOK_DIR="$selected"
+  export ZK_NOTEBOOK_DIR="$selected"
+  notify "Switched to: $selected"
+
+  # Show main menu with new notebook
+  show_main_menu
+}
+
+# Usage
+usage() {
+  cat <<EOF
+Usage: zkpick [command] [args]
+
+Commands:
+  (none)      Show main menu
+  search      Search notes (optional: search term)
+  new         Create new note (optional: title)
+  daily       Open/create daily journal
+  tags        Browse tags
+  recent      Show recent notes
+  orphans     Show orphan notes
+  notebook    Switch notebook
+
+Options:
+  -n, --notebook PATH    Use specific notebook
+  -h, --help             Show this help
+
+Examples:
+  zkpick                    # Main menu
+  zkpick search "project"   # Search for "project"
+  zkpick new "My Note"      # Create note with title
+  zkpick daily              # Daily journal
+  zkpick -n ~/notes tags    # Browse tags in ~/notes
+
+EOF
+}
+
+# Parse arguments
+main() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    -n | --notebook)
+      NOTEBOOK_DIR="$2"
+      shift 2
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    search)
+      shift
+      set_notebook
+      local idx path
+      local tmpfile=$(mktemp)
+      local displayfile=$(mktemp)
+      trap "rm -f $tmpfile $displayfile" EXIT
+
+      if [[ $# -gt 0 ]]; then
+        zk list --format json -m "$1" -q 2>/dev/null |
+          jq -r '.[] | "\(.title)\t\(.filename)\t\(.absPath)"' >"$tmpfile"
+      else
+        zk list --format json -q 2>/dev/null |
+          jq -r '.[] | "\(.title)\t\(.filename)\t\(.absPath)"' >"$tmpfile"
+      fi
+
+      while IFS=$'\t' read -r t f p; do
+        format_note_display "$t" "$f"
+      done <"$tmpfile" >"$displayfile"
+
+      idx=$(run_menu "Search" <"$displayfile")
+      [[ -z "$idx" ]] && exit 0
+
+      local linenum=$((idx + 1))
+      path=$(sed -n "${linenum}p" "$tmpfile" | cut -f3)
+
+      [[ -n "$path" ]] && open_in_editor "$path"
+      exit 0
+      ;;
+    new)
+      shift
+      if [[ $# -gt 0 ]]; then
+        set_notebook
+        local note_path
+        note_path=$(zk new --title "$1" --print-path 2>/dev/null)
+        [[ -n "$note_path" ]] && open_in_editor "$note_path"
+      else
+        do_new_note
+      fi
+      exit 0
+      ;;
+    daily)
+      do_daily
+      exit 0
+      ;;
+    tags)
+      do_browse_tags
+      exit 0
+      ;;
+    recent)
+      do_recent
+      exit 0
+      ;;
+    orphans)
+      do_orphans
+      exit 0
+      ;;
+    notebook)
+      do_switch_notebook
+      exit 0
+      ;;
+    *)
+      echo "Unknown command: $1" >&2
+      usage
+      exit 1
+      ;;
+    esac
+  done
+
+  # No command - show main menu
+  show_main_menu
+}
+
+main "$@"
